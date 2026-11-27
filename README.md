@@ -66,22 +66,26 @@ vitreous.exe --desktop
 ```
 
 球不再待在窗口里，而是直接浮在桌面上，折射的是真实的桌面内容：终端文字、壁纸、正在播放的视频
-都会被实时弯曲。拖动它、甩到屏幕边缘会回弹；`1`/`2`/`3` 切换 Circle/Pill/Squircle，
-`Esc` 或右键退出。
+都会被实时弯曲。屏幕底部还有一个浮空的控制面板，形状、背景、四个滑块都能直接点，
+除此之外屏幕上没有别的东西。
+
+拖动球、甩到屏幕边缘会回弹；`1`/`2`/`3` 切换 Circle/Pill/Squircle，`Esc` 或右键退出。
 
 实现方式：
 
-- 窗口是 `WS_EX_LAYERED | WS_EX_TOPMOST` 的弹出窗口，尺寸跟着球走；
+- 两个 `WS_EX_LAYERED | WS_EX_TOPMOST` 弹出窗口共用一个 GL 上下文：球窗跟着球走，面板窗固定在底部居中；
 - 用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 把自己从系统捕获里排除，
   再用 `BitBlt` 抓取球下方的桌面作为背景纹理——不排除的话会抓到自己，形成白色反馈；
-- 渲染结果先 `glReadPixels` 回来，预乘 alpha、翻转行序后交给 `UpdateLayeredWindow` 逐像素合成。
+- 渲染结果先 `glReadPixels` 回来，预乘 alpha、翻转行序后交给 `UpdateLayeredWindow` 逐像素合成；
+- 球窗只覆盖球 + 投影的范围（每帧像素比整屏少一个量级），面板按半帧率刷新以省 GPU。
 
 限制与取舍：
 
 - 需要 Windows 10 2004+（该 capture-exclusion 标志要求）和支持 OpenGL 3.3 的驱动；
 - 正因为它对捕获不可见，录屏和截图里都拍不到这个球；
-- 桌面模式不显示控制面板，形状用数字键切换；
-- 2560×1600、dpr 1.5 下大约 35 fps（每帧一次 BitBlt + 一次回读）。
+- 面板和球一样对截图/录屏不可见；
+- 面板边缘的阴影区域会吃掉鼠标（分层窗口按 alpha 命中测试，半透明像素不再穿透）；
+- 2560×1600、dpr 1.5 下大约 40 fps（球窗 768×768，每帧一次 BitBlt + 一次回读）。
 
 ## 命令行参数
 
@@ -98,7 +102,9 @@ vitreous.exe --desktop
 | `--image PATH` | 启动时载入背景图片（png/jpg/bmp/webp） |
 | `--click X,Y` | 在客户区坐标处模拟一次点击 |
 | `--drag X0,Y0,X1,Y1` | 模拟一次拖拽 |
-| `--desktop` | 桌面模式：球浮在真实桌面上，折射实时桌面 |
+| `--desktop` | 桌面模式：球 + 控制面板浮在真实桌面上，折射实时桌面 |
+| `--freeze` | 桌面模式调试：只抓取首帧桌面，窗口不排除捕获（便于截图验证） |
+| `--debug-cap` | 桌面模式调试：不排除捕获（会看到白色自反馈） |
 | `--log` | 日志写入 `vitreous.log` |
 
 示例：

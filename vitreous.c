@@ -754,7 +754,7 @@ static GLint g_uBlur, g_uFrostMix;
 static GLint g_bTex, g_bRes, g_bStep, g_bSigma;
 static GLuint g_blurTex[2] = { 0, 0 }, g_blurFbo[2] = { 0, 0 };
 static int g_blurW[2] = { 0, 0 }, g_blurH[2] = { 0, 0 };
-static GLint g_sScene, g_sUi, g_sRes, g_sRect, g_sRadius, g_sDpr;
+static GLint g_sScene, g_sUi, g_sRes, g_sRect, g_sRadius, g_sDpr, g_sOverlay;
 static GLint g_pTex, g_pAlpha, g_pRect, g_pRes;
 static GLuint g_vaoTri = 0, g_vboTri = 0, g_vaoQuad = 0, g_vboQuad = 0;
 static GLuint g_sceneTex = 0, g_sceneFbo = 0;
@@ -977,6 +977,7 @@ static const char *SHEET_FS =
     "uniform vec4 uRect;   // x, y, x+w, y+h  (top-left origin)\n"
     "uniform float uRadius;\n"
     "uniform float uDpr;\n"
+    "uniform float uOverlay;   // 1 = 输出带 alpha 的桌面叠加\n"
     "\n"
     "float sdRoundBox(vec2 p, vec2 b, float r){\n"
     "  vec2 q = abs(p) - b + r;\n"
@@ -998,6 +999,7 @@ static const char *SHEET_FS =
     "  vec3 col = scene * (1.0 - sh);\n"
     "\n"
     "  float cov = clamp(0.5 - d, 0.0, 1.0);\n"
+    "  vec3 sheet = vec3(0.0);\n"
     "  if (cov > 0.0) {\n"
     "    const vec2 R6[6] = vec2[6](vec2(1.,0.), vec2(.5,.866), vec2(-.5,.866),\n"
     "                               vec2(-1.,0.), vec2(-.5,-.866), vec2(.5,-.866));\n"
@@ -1009,7 +1011,7 @@ static const char *SHEET_FS =
     "    float lum = dot(b, vec3(0.2126, 0.7152, 0.0722));\n"
     "    b = mix(vec3(lum), b, 1.4);\n"
     "\n"
-    "    vec3 sheet = mix(b, vec3(22.0, 24.0, 34.0) / 255.0, 0.62);\n"
+    "    sheet = mix(b, vec3(22.0, 24.0, 34.0) / 255.0, 0.62);\n"
     "    float ln = 1.0 - smoothstep(0.0, 1.2*uDpr, abs(d + 0.5*uDpr));\n"
     "    sheet = mix(sheet, vec3(1.0), ln * 0.12);\n"
     "\n"
@@ -1018,7 +1020,12 @@ static const char *SHEET_FS =
     "    sheet = mix(sheet, ui.rgb, ui.a);\n"
     "    col = mix(col, sheet, cov);\n"
     "  }\n"
-    "  outColor = vec4(col, 1.0);\n"
+    "  if (uOverlay > 0.5) {\n"
+    "    if (cov > 0.0) outColor = vec4(sheet, 1.0);\n"
+    "    else outColor = vec4(0.0, 0.0, 0.0, sh);\n"
+    "  } else {\n"
+    "    outColor = vec4(col, 1.0);\n"
+    "  }\n"
     "}\n";
 
 static const char *SPRITE_VS =
@@ -1235,6 +1242,7 @@ static void gl_init_resources(void)
     g_sRect = glGetUniformLocation(g_sheetProg, "uRect");
     g_sRadius = glGetUniformLocation(g_sheetProg, "uRadius");
     g_sDpr = glGetUniformLocation(g_sheetProg, "uDpr");
+    g_sOverlay = glGetUniformLocation(g_sheetProg, "uOverlay");
 
     g_pTex = glGetUniformLocation(g_spriteProg, "uTex");
     g_pAlpha = glGetUniformLocation(g_spriteProg, "uAlpha");
@@ -2125,6 +2133,7 @@ static void render(void)
     glUniform4f(g_sRect, L.sheetX, L.sheetY, L.sheetX + L.sheetW, L.sheetY + L.sheetH);
     glUniform1f(g_sRadius, 22.0f * g.dpr);
     glUniform1f(g_sDpr, g.dpr);
+    glUniform1f(g_sOverlay, 0.0f);
     glBindVertexArray(g_vaoTri);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -2374,17 +2383,17 @@ static void overlay_render(void)
 }
 
 /* 预乘 alpha 后交给 DWM 合成 */
-static void overlay_present(void)
+static void layered_blit(HWND hwnd, Canvas *lay, GLuint fbo, int x, int y, int w, int h)
 {
     BLENDFUNCTION bf;
     POINT dst, src;
     SIZE sz;
-    uint32_t *p = g_layCanvas.px;
-    int n = g.rw * g.rh;
+    uint32_t *p = lay->px;
+    int n = w * h;
 
-    glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glReadPixels(0, 0, g.rw, g.rh, GL_BGRA, GL_UNSIGNED_BYTE, p);
+    glReadPixels(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, p);
 
     for (int i = 0; i < n; i++) {
         uint32_t c = p[i];
@@ -2400,13 +2409,13 @@ static void overlay_present(void)
     }
 
     /* glReadPixels 是自下而上，DIB 是自上而下，翻转 */
-    for (int y = 0; y < g.rh / 2; y++) {
-        uint32_t *ra = p + (size_t)y * (size_t)g.rw;
-        uint32_t *rb = p + (size_t)(g.rh - 1 - y) * (size_t)g.rw;
-        for (int x = 0; x < g.rw; x++) {
-            uint32_t t = ra[x];
-            ra[x] = rb[x];
-            rb[x] = t;
+    for (int yy = 0; yy < h / 2; yy++) {
+        uint32_t *ra = p + (size_t)yy * (size_t)w;
+        uint32_t *rb = p + (size_t)(h - 1 - yy) * (size_t)w;
+        for (int xx = 0; xx < w; xx++) {
+            uint32_t t = ra[xx];
+            ra[xx] = rb[xx];
+            rb[xx] = t;
         }
     }
 
@@ -2414,13 +2423,105 @@ static void overlay_present(void)
     bf.BlendFlags = 0;
     bf.SourceConstantAlpha = 255;
     bf.AlphaFormat = AC_SRC_ALPHA;
-    dst.x = g.ox;
-    dst.y = g.oy;
+    dst.x = x;
+    dst.y = y;
     src.x = 0;
     src.y = 0;
-    sz.cx = g.rw;
-    sz.cy = g.rh;
-    UpdateLayeredWindow(g.hwnd, NULL, &dst, &sz, g_layCanvas.dc, &src, 0, &bf, ULW_ALPHA);
+    sz.cx = w;
+    sz.cy = h;
+    UpdateLayeredWindow(hwnd, NULL, &dst, &sz, lay->dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+static void overlay_present(void)
+{
+    layered_blit(g.hwnd, &g_layCanvas, g_sceneFbo, g.ox, g.oy, g.rw, g.rh);
+}
+
+/* ---- 设置框：第二个分层窗口，独立抓桌面、独立合成 ---- */
+static HWND g_panelHwnd = NULL;
+static Canvas g_pCap, g_pLay;
+static GLuint g_pBgTex = 0, g_pSceneTex = 0, g_pFbo = 0;
+static int g_pSceneW = 0, g_pSceneH = 0;
+static int g_px, g_py, g_pw, g_ph;
+
+static void panel_alloc(int w, int h)
+{
+    fbo_target(&g_pSceneTex, &g_pFbo, &g_pSceneW, &g_pSceneH, w, h);
+    canvas_init(&g_pCap, w, h, g.hdc);
+    canvas_init(&g_pLay, w, h, g.hdc);
+    g_pw = w;
+    g_ph = h;
+}
+
+static void panel_layout(void)
+{
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+    int m, x, y, w, h;
+
+    if (!g_panelHwnd || L.sheetW < 4.0f) return;
+    m = (int)(56.0f * g.dpr);
+    x = (int)L.sheetX - m;
+    y = (int)L.sheetY - m;
+    w = (int)L.sheetW + m * 2;
+    h = (int)L.sheetH + m * 2;
+    /* 贴边时裁掉超出的投影留白，但保持窗口内 sheet 的位置不变 */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > scrW) w = scrW - x;
+    if (y + h > scrH) h = scrH - y;
+    if (x == g_px && y == g_py && w == g_pw && h == g_ph) return;
+    g_px = x;
+    g_py = y;
+    panel_alloc(w, h);
+    SetWindowPos(g_panelHwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+static void panel_capture(void)
+{
+    HDC sdc;
+
+    if (!g_pBgTex) glGenTextures(1, &g_pBgTex);
+    sdc = GetDC(NULL);
+    BitBlt(g_pCap.dc, 0, 0, g_pw, g_ph, sdc, g_px, g_py, SRCCOPY | CAPTUREBLT);
+    ReleaseDC(NULL, sdc);
+
+    glBindTexture(GL_TEXTURE_2D, g_pBgTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g_pw, g_ph, 0, GL_BGRA, GL_UNSIGNED_BYTE,
+                 g_pCap.px);
+}
+
+static void panel_render(void)
+{
+    float lx = L.sheetX - (float)g_px;
+    float ly = L.sheetY - (float)g_py;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pFbo);
+    glViewport(0, 0, g_pw, g_ph);
+    glUseProgram(g_sheetProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_pBgTex);
+    glUniform1i(g_sScene, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_uiTex);
+    glUniform1i(g_sUi, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform2f(g_sRes, (float)g_pw, (float)g_ph);
+    glUniform4f(g_sRect, lx, ly, lx + L.sheetW, ly + L.sheetH);
+    glUniform1f(g_sRadius, 22.0f * g.dpr);
+    glUniform1f(g_sDpr, g.dpr);
+    glUniform1f(g_sOverlay, 1.0f);
+    glBindVertexArray(g_vaoTri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+static void panel_present(void)
+{
+    layered_blit(g_panelHwnd, &g_pLay, g_pFbo, g_px, g_py, g_pw, g_ph);
 }
 
 /* 让分层窗口跟着玻璃球走，矩形同时作为抓取区域 */
@@ -2432,7 +2533,7 @@ static void overlay_layout(void)
     int w, h, ox, oy, pad;
 
     for (int i = 0; i < N_NODES; i++) rmax = FMAX(rmax, g_radii[i]);
-    pad = (int)(150.0f * g.dpr);
+    pad = (int)(72.0f * g.dpr);   /* 覆盖 44*dpr 的投影与 14*dpr 的下偏移 */
     w = (int)(2.0f * rmax) + pad * 2;
     w = (w + 63) & ~63;   /* 量化，避免每帧重建缓冲 */
     h = w;
@@ -2477,6 +2578,19 @@ static void run_overlay(void)
 
     overlay_layout();
 
+    layout_update();
+    g.uiDirty = 1;
+    ui_rebuild();
+
+    g_panelHwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                                  L"VitreousWnd", L"Vitreous — controls", WS_POPUP,
+                                  0, 0, 64, 64, NULL, NULL, g.inst, NULL);
+    if (!g_panelHwnd) fatal("CreateWindowExW (panel) failed");
+    if (!g.noExclude && !g.freezeCap)
+        SetWindowDisplayAffinity(g_panelHwnd, WDA_EXCLUDEFROMCAPTURE);
+    panel_layout();
+    ShowWindow(g_panelHwnd, SW_SHOWNA);
+
     if (g.shotMode) {
         int steps = (int)((float)g.shotMs / 1000.0f / H_STEP);
         for (int i = 0; i < steps; i++) step_physics(H_STEP);
@@ -2487,6 +2601,20 @@ static void run_overlay(void)
         save_bmp(g.shotPath, (const uint8_t *)g_layCanvas.px, g.rw, g.rh);
         logf_("overlay shot: screen %dx%d dpr=%.2f baseR=%.1f win=%dx%d\n",
               scrW, scrH, g.dpr, g.baseR, g.ow, g.oh);
+        {
+            wchar_t p2[1024];
+            size_t n = wcslen(g.shotPath);
+            panel_capture();
+            panel_render();
+            glBindFramebuffer(GL_FRAMEBUFFER, g_pFbo);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(0, 0, g_pw, g_ph, GL_BGRA, GL_UNSIGNED_BYTE, g_pLay.px);
+            if (n > 4 && n < 1000) {
+                wcscpy(p2, g.shotPath);
+                wcscpy(p2 + n - 4, L"_panel.bmp");
+                save_bmp(p2, (const uint8_t *)g_pLay.px, g_pw, g_ph);
+            }
+        }
         return;
     }
 
@@ -2516,16 +2644,27 @@ static void run_overlay(void)
             }
         }
 
+        int panelNow;
+        layout_update();
+        panelNow = g.uiDirty || (frames & 1) == 0;
+        if (g.uiDirty) ui_rebuild();
         overlay_layout();
         if (!g.freezeCap || frames == 0) overlay_capture();
         overlay_render();
         overlay_present();
 
+        panel_layout();
+        if (panelNow) {
+            if (!g.freezeCap || frames == 0) panel_capture();
+            panel_render();
+            panel_present();
+        }
+
         if (frames == 0)
             logf_("overlay: screen %dx%d dpr=%.2f baseR=%.1f win=%dx%d\n",
                   scrW, scrH, g.dpr, g.baseR, g.ow, g.oh);
         frames++;
-        if (g.logOn && frames % 120 == 0)
+        if (g.logOn && frames % 60 == 0)
             logf_("overlay frames=%d t=%.1f st=(%.0f,%.0f)\n", frames, now_sec(), g.st.x, g.st.y);
         Sleep(1);
     }
@@ -2547,6 +2686,77 @@ static void update_cursor(void)
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (g_panelHwnd && hwnd == g_panelHwnd) {
+        float sx = (float)GET_X_LPARAM(lp) + (float)g_px;
+        float sy = (float)GET_Y_LPARAM(lp) + (float)g_py;
+
+        if (msg == WM_MOUSEMOVE) {
+            TRACKMOUSEEVENT tme;
+            memset(&tme, 0, sizeof(tme));
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            if (g.sliderDrag) {
+                set_slider_from_x(g.active, sx);
+                update_cursor();
+                return 0;
+            }
+            {
+                int nh = hit_widget(sx, sy);
+                if (nh != g.hover) {
+                    g.hover = nh;
+                    g.uiDirty = 1;
+                }
+            }
+            update_cursor();
+            return 0;
+        }
+        if (msg == WM_LBUTTONDOWN) {
+            int w = hit_widget(sx, sy);
+            SetFocus(hwnd);
+            if (w != W_NONE) {
+                g.active = w;
+                g.hover = w;
+                g.uiDirty = 1;
+                if (w >= W_SLIDER0 && w <= W_SLIDER3) {
+                    g.sliderDrag = 1;
+                    set_slider_from_x(w, sx);
+                }
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
+        if (msg == WM_LBUTTONUP) {
+            if (g.sliderDrag) {
+                g.sliderDrag = 0;
+                g.active = W_NONE;
+                ReleaseCapture();
+                return 0;
+            }
+            if (g.active != W_NONE) {
+                int w = g.active;
+                g.active = W_NONE;
+                ReleaseCapture();
+                if (w == hit_widget(sx, sy)) activate_widget(w);
+                g.uiDirty = 1;
+            }
+            return 0;
+        }
+        if (msg == WM_MOUSELEAVE) {
+            if (g.hover != W_NONE) {
+                g.hover = W_NONE;
+                g.uiDirty = 1;
+            }
+            return 0;
+        }
+        if (msg == WM_CAPTURECHANGED) {
+            g.sliderDrag = 0;
+            g.active = W_NONE;
+            return 0;
+        }
+    }
+
     switch (msg) {
     case WM_CREATE:
         break;
@@ -2870,7 +3080,8 @@ static void parse_args(void)
                         L"  [--dpr 1.5] [--shape circle|pill|squircle|0|1|2]\n"
                         L"  [--bg poster|grid|image|0|1|2] [--image PATH] [--collapse]\n"
                         L"  [--values r,d,f,j] [--click x,y] [--drag x0,y0,x1,y1] [--desktop] [--log]\n"
-                        L"  desktop mode: 1/2/3 switch shape, Esc or right-click quits",
+                        L"  desktop mode: floating panel + ball on the live desktop\n"
+                        L"                1/2/3 switch shape, Esc or right-click quits",
                         L"Vitreous", MB_OK);
             ExitProcess(0);
         }
