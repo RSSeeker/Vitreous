@@ -6,6 +6,8 @@
 
 界面全部英文：标题、面板、提示、海报与网格文字都是英文。
 
+**下载**：从 [Releases](https://github.com/RSSeeker/Vitreous/releases/latest) 获取编译好的 `vitreous.exe`（Windows 10+，需要 OpenGL 3.3 驱动）。
+
 ![Vitreous](preview.png)
 
 ![Grid](preview2.png)
