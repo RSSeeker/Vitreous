@@ -19,7 +19,7 @@
   以及 R/G/B 三通道分别偏移采样得到的色散。
 - **物理**：固定步长 1/240 的弹簧-阻尼拖拽（K=520, ζ=0.8），自由飞行阻尼、撞墙恢复系数 0.55；
   速度驱动的果冻形变（lap 平滑 + 均值归零），按下时整体回弹放大到 1.07。
-- **磨砂**：可分离高斯模糊，两遍 ping-pong（11×11 采样），σ = frost × 7 px；
+- **磨砂**：可分离高斯模糊，两遍 ping-pong（每遍 13 抽样，σ = frost × 7 px）；
   玻璃着色器再按 `uFrostMix` 在清晰背景与模糊背景之间插值。
 - **背景**：Poster（加色径向光斑 + 网格 + `VITREOUS` 大标题 + 图例）、Grid（色带 + 坐标标签 +
   大号 `REFRACT`）、以及通过 WIC 解码的任意图片（cover 填充）。
@@ -28,6 +28,7 @@
   （content-box 440×171，外框 470×199 @ dpr 1）。
 - **交互**：按住玻璃拖动 / 甩出撞墙、点击切换形状与背景、滑块实时调参、收起面板、
   上传图片（文件对话框）、提示文字首次拖动后 0.6 s 淡出、窗口缩放与高 DPI 自适应。
+- **桌面模式**：`--desktop` 把球浮在真实桌面上，折射桌面实时内容（见下文）。
 
 ## 构建
 
@@ -58,6 +59,30 @@ vitreous.exe
 默认 1180×780 可调窗口；拖动玻璃、甩出去撞墙。面板里的滑块分别是
 Refraction、Dispersion、Frost、Jelly（0..1）。
 
+## 桌面模式
+
+```bat
+vitreous.exe --desktop
+```
+
+球不再待在窗口里，而是直接浮在桌面上，折射的是真实的桌面内容：终端文字、壁纸、正在播放的视频
+都会被实时弯曲。拖动它、甩到屏幕边缘会回弹；`1`/`2`/`3` 切换 Circle/Pill/Squircle，
+`Esc` 或右键退出。
+
+实现方式：
+
+- 窗口是 `WS_EX_LAYERED | WS_EX_TOPMOST` 的弹出窗口，尺寸跟着球走；
+- 用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 把自己从系统捕获里排除，
+  再用 `BitBlt` 抓取球下方的桌面作为背景纹理——不排除的话会抓到自己，形成白色反馈；
+- 渲染结果先 `glReadPixels` 回来，预乘 alpha、翻转行序后交给 `UpdateLayeredWindow` 逐像素合成。
+
+限制与取舍：
+
+- 需要 Windows 10 2004+（该 capture-exclusion 标志要求）和支持 OpenGL 3.3 的驱动；
+- 正因为它对捕获不可见，录屏和截图里都拍不到这个球；
+- 桌面模式不显示控制面板，形状用数字键切换；
+- 2560×1600、dpr 1.5 下大约 35 fps（每帧一次 BitBlt + 一次回读）。
+
 ## 命令行参数
 
 | 参数 | 说明 |
@@ -73,6 +98,7 @@ Refraction、Dispersion、Frost、Jelly（0..1）。
 | `--image PATH` | 启动时载入背景图片（png/jpg/bmp/webp） |
 | `--click X,Y` | 在客户区坐标处模拟一次点击 |
 | `--drag X0,Y0,X1,Y1` | 模拟一次拖拽 |
+| `--desktop` | 桌面模式：球浮在真实桌面上，折射实时桌面 |
 | `--log` | 日志写入 `vitreous.log` |
 
 示例：
@@ -93,6 +119,7 @@ vitreous.exe --shot hi.bmp --dpr 1.5 --size 1180x780 --shape pill
 | 布局 | `layout_update` 按内容盒模型计算面板与各控件矩形 |
 | 界面 | `ui_rebuild` 把面板内容画进透明画布再上传纹理 |
 | 渲染 | 玻璃全屏三角形 → 场景 FBO；磨砂两遍高斯 → blur FBO；面板 pass 做 backdrop 模糊/染色/描边并与 UI 纹理合成 |
+| 桌面模式 | 分层窗口跟随球体，`WDA_EXCLUDEFROMCAPTURE` 排除自身捕获，BitBlt 球下桌面 → 纹理，`UpdateLayeredWindow` 合成 |
 | 窗口 | WGL 3.3 core 上下文、DPI 感知、鼠标/键盘、resize |
 | 工具 | `--shot` 离屏 BMP、`--click/--drag` 合成事件、日志 |
 

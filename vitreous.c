@@ -706,7 +706,15 @@ typedef struct {
     int shotMs;
 
     int logOn;
+    int noExclude;
+    int freezeCap;
     int argW, argH;
+
+    /* 桌面叠加模式 */
+    int overlay;
+    int rw, rh;      /* render target size (may differ from W,H) */
+    int ox, oy;      /* overlay window position on screen */
+    int ow, oh;      /* overlay window size */
 } App;
 
 static App g;
@@ -741,7 +749,7 @@ static Layout L;
 
 /* GL 对象 */
 static GLuint g_glassProg = 0, g_sheetProg = 0, g_spriteProg = 0, g_blurProg = 0;
-static GLint g_uBg, g_uRes, g_uCenter, g_uR, g_uRefract, g_uDisp, g_uFrost, g_uEdge, g_uDpr;
+static GLint g_uBg, g_uRes, g_uCenter, g_uR, g_uRefract, g_uDisp, g_uFrost, g_uEdge, g_uDpr, g_uOverlay;
 static GLint g_uBlur, g_uFrostMix;
 static GLint g_bTex, g_bRes, g_bStep, g_bSigma;
 static GLuint g_blurTex[2] = { 0, 0 }, g_blurFbo[2] = { 0, 0 };
@@ -837,6 +845,7 @@ static const char *GLASS_FS =
     "uniform vec2 uCenter;   // px, top-left origin\n"
     "uniform float uR[48];   // radius per angle, px\n"
     "uniform float uRefract, uDisp, uFrost, uEdge, uDpr;\n"
+    "uniform float uOverlay;   // 1 = alpha over live desktop\n"
     "const int N = 48;\n"
     "const float TAU = 6.28318530718;\n"
     "\n"
@@ -887,7 +896,10 @@ static const char *GLASS_FS =
     "  float shadow = (1.0 - smoothstep(-10.0*uDpr, 46.0*uDpr, ds)) * 0.32;\n"
     "  vec3 outside = bg * (1.0 - shadow);\n"
     "\n"
-    "  if (d > 2.0) { outColor = vec4(outside, 1.0); return; }\n"
+    "  if (d > 2.0) {\n"
+    "    if (uOverlay > 0.5) { outColor = vec4(0.0); return; }\n"
+    "    outColor = vec4(outside, 1.0); return;\n"
+    "  }\n"
     "\n"
     "  // bevel profile: 0 at rim -> 1 deep inside\n"
     "  float t = clamp(-d / uEdge, 0.0, 1.0);\n"
@@ -921,6 +933,13 @@ static const char *GLASS_FS =
     "  col += line * (0.18 + 0.35 * max(dot(n, L), 0.0));\n"
     "\n"
     "  float alpha = clamp(0.5 - d, 0.0, 1.0);\n"
+    "  if (uOverlay > 0.5) {\n"
+    "    float sa = (1.0 - smoothstep(-6.0*uDpr, 34.0*uDpr, ds)) * 0.30;\n"
+    "    float fa = alpha + sa * (1.0 - alpha);\n"
+    "    vec3 fc = (col * alpha) / max(fa, 1e-4);\n"
+    "    outColor = vec4(fc, fa);\n"
+    "    return;\n"
+    "  }\n"
     "  outColor = vec4(mix(outside, col, alpha), 1.0);\n"
     "}\n";
 
@@ -1201,6 +1220,7 @@ static void gl_init_resources(void)
     g_uFrost = glGetUniformLocation(g_glassProg, "uFrost");
     g_uEdge = glGetUniformLocation(g_glassProg, "uEdge");
     g_uDpr = glGetUniformLocation(g_glassProg, "uDpr");
+    g_uOverlay = glGetUniformLocation(g_glassProg, "uOverlay");
     g_uBlur = glGetUniformLocation(g_glassProg, "uBlur");
     g_uFrostMix = glGetUniformLocation(g_glassProg, "uFrostMix");
 
@@ -2041,12 +2061,12 @@ static void blur_scene(float sigma)
 
     glUseProgram(g_blurProg);
     glBindVertexArray(g_vaoTri);
-    glUniform2f(g_bRes, (float)g.W, (float)g.H);
+    glUniform2f(g_bRes, (float)g.rw, (float)g.rh);
     glUniform1f(g_bSigma, sigma);
     glActiveTexture(GL_TEXTURE0);
 
     glBindFramebuffer(GL_FRAMEBUFFER, g_blurFbo[0]);
-    glViewport(0, 0, g.W, g.H);
+    glViewport(0, 0, g.rw, g.rh);
     glBindTexture(GL_TEXTURE_2D, g_bgTex);
     glUniform2f(g_bStep, step, 0.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -2067,7 +2087,7 @@ static void render(void)
 
     /* pass 1: glass -> sceneTex */
     glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFbo);
-    glViewport(0, 0, g.W, g.H);
+    glViewport(0, 0, g.rw, g.rh);
     glUseProgram(g_glassProg);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, g_blurTex[1]);
@@ -2075,7 +2095,7 @@ static void render(void)
     glBindTexture(GL_TEXTURE_2D, g_bgTex);
     glUniform1i(g_uBg, 0);
     glUniform1f(g_uFrostMix, doBlur ? FMIN(1.0f, g.frost * 25.0f) : 0.0f);
-    glUniform2f(g_uRes, (float)g.W, (float)g.H);
+    glUniform2f(g_uRes, (float)g.rw, (float)g.rh);
     glUniform2f(g_uCenter, g.st.x, g.st.y);
     glUniform1fv(g_uR, N_NODES, g_radii);
     glUniform1f(g_uRefract, g.refract);
@@ -2092,7 +2112,7 @@ static void render(void)
 
     /* pass 2: sheet + backdrop blur -> target */
     glBindFramebuffer(GL_FRAMEBUFFER, target);
-    glViewport(0, 0, g.W, g.H);
+    glViewport(0, 0, g.rw, g.rh);
     glUseProgram(g_sheetProg);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_sceneTex);
@@ -2101,7 +2121,7 @@ static void render(void)
     glBindTexture(GL_TEXTURE_2D, g_uiTex);
     glUniform1i(g_sUi, 1);
     glActiveTexture(GL_TEXTURE0);
-    glUniform2f(g_sRes, (float)g.W, (float)g.H);
+    glUniform2f(g_sRes, (float)g.rw, (float)g.rh);
     glUniform4f(g_sRect, L.sheetX, L.sheetY, L.sheetX + L.sheetW, L.sheetY + L.sheetH);
     glUniform1f(g_sRadius, 22.0f * g.dpr);
     glUniform1f(g_sDpr, g.dpr);
@@ -2247,6 +2267,8 @@ static void app_resize(int W, int H)
     oldH = g.H;
     g.W = W;
     g.H = H;
+    g.rw = W;
+    g.rh = H;
     g.dpr = g.dprOverride > 0.0f ? g.dprOverride : dpi_scale(g.hwnd);
     if (g.dpr > 2.0f) g.dpr = 2.0f;
     if (g.dpr < 0.5f) g.dpr = 0.5f;
@@ -2279,6 +2301,237 @@ static void app_resize(int W, int H)
 /*  窗口过程                                                                   */
 /* ========================================================================== */
 
+
+/* ========================================================================== */
+/*  桌面叠加模式：透明分层窗口 + 实时抓取桌面                                    */
+/* ========================================================================== */
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
+static Canvas g_capCanvas;   /* 桌面抓取缓冲 */
+static Canvas g_layCanvas;   /* 送显缓冲 */
+
+static void overlay_alloc(int w, int h)
+{
+    if (w < 64) w = 64;
+    if (h < 64) h = 64;
+    g.rw = w;
+    g.rh = h;
+    fbo_target(&g_sceneTex, &g_sceneFbo, &g_sceneW, &g_sceneH, w, h);
+    fbo_target(&g_blurTex[0], &g_blurFbo[0], &g_blurW[0], &g_blurH[0], w, h);
+    fbo_target(&g_blurTex[1], &g_blurFbo[1], &g_blurW[1], &g_blurH[1], w, h);
+    canvas_init(&g_capCanvas, w, h, g.hdc);
+    canvas_init(&g_layCanvas, w, h, g.hdc);
+    glViewport(0, 0, w, h);
+}
+
+static void overlay_capture(void)
+{
+    HDC sdc = GetDC(NULL);
+    BitBlt(g_capCanvas.dc, 0, 0, g.rw, g.rh, sdc, g.ox, g.oy, SRCCOPY | CAPTUREBLT);
+    ReleaseDC(NULL, sdc);
+
+    glBindTexture(GL_TEXTURE_2D, g_bgTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g.rw, g.rh, 0, GL_BGRA, GL_UNSIGNED_BYTE,
+                 g_capCanvas.px);
+}
+
+static void overlay_render(void)
+{
+    float minR = g_r0[0];
+    float sigma = g.frost * 7.0f * g.dpr;
+    int doBlur = sigma > 0.6f;
+
+    for (int i = 1; i < N_NODES; i++) minR = FMIN(minR, g_r0[i]);
+    if (doBlur) blur_scene(sigma);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFbo);
+    glViewport(0, 0, g.rw, g.rh);
+    glUseProgram(g_glassProg);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_blurTex[1]);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_bgTex);
+    glUniform1i(g_uBg, 0);
+    glUniform1f(g_uFrostMix, doBlur ? FMIN(1.0f, g.frost * 25.0f) : 0.0f);
+    glUniform2f(g_uRes, (float)g.rw, (float)g.rh);
+    glUniform2f(g_uCenter, g.st.x - (float)g.ox, g.st.y - (float)g.oy);
+    glUniform1fv(g_uR, N_NODES, g_radii);
+    glUniform1f(g_uRefract, g.refract);
+    glUniform1f(g_uDisp, g.disp);
+    glUniform1f(g_uFrost, g.frost);
+    glUniform1f(g_uEdge, FMAX(minR * g.st.scale * 0.55f, 1.0f));
+    glUniform1f(g_uDpr, g.dpr);
+    glUniform1f(g_uOverlay, 1.0f);
+    glBindVertexArray(g_vaoTri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* 预乘 alpha 后交给 DWM 合成 */
+static void overlay_present(void)
+{
+    BLENDFUNCTION bf;
+    POINT dst, src;
+    SIZE sz;
+    uint32_t *p = g_layCanvas.px;
+    int n = g.rw * g.rh;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_sceneFbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, g.rw, g.rh, GL_BGRA, GL_UNSIGNED_BYTE, p);
+
+    for (int i = 0; i < n; i++) {
+        uint32_t c = p[i];
+        uint32_t a = (c >> 24) & 0xFFu;
+        if (a != 0 && a != 255u) {
+            uint32_t rb = (((c & 0x00FF00FFu) * a) + 0x00800080u) >> 8;
+            uint32_t gg = ((((c >> 8) & 0xFFu) * a) + 0x80u) >> 8;
+            c = (a << 24) | (rb & 0x00FF00FFu) | ((gg & 0xFFu) << 8);
+        } else if (a == 0) {
+            c = 0;
+        }
+        p[i] = c;
+    }
+
+    /* glReadPixels 是自下而上，DIB 是自上而下，翻转 */
+    for (int y = 0; y < g.rh / 2; y++) {
+        uint32_t *ra = p + (size_t)y * (size_t)g.rw;
+        uint32_t *rb = p + (size_t)(g.rh - 1 - y) * (size_t)g.rw;
+        for (int x = 0; x < g.rw; x++) {
+            uint32_t t = ra[x];
+            ra[x] = rb[x];
+            rb[x] = t;
+        }
+    }
+
+    bf.BlendOp = AC_SRC_OVER;
+    bf.BlendFlags = 0;
+    bf.SourceConstantAlpha = 255;
+    bf.AlphaFormat = AC_SRC_ALPHA;
+    dst.x = g.ox;
+    dst.y = g.oy;
+    src.x = 0;
+    src.y = 0;
+    sz.cx = g.rw;
+    sz.cy = g.rh;
+    UpdateLayeredWindow(g.hwnd, NULL, &dst, &sz, g_layCanvas.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+/* 让分层窗口跟着玻璃球走，矩形同时作为抓取区域 */
+static void overlay_layout(void)
+{
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+    float rmax = 0.0f;
+    int w, h, ox, oy, pad;
+
+    for (int i = 0; i < N_NODES; i++) rmax = FMAX(rmax, g_radii[i]);
+    pad = (int)(150.0f * g.dpr);
+    w = (int)(2.0f * rmax) + pad * 2;
+    w = (w + 63) & ~63;   /* 量化，避免每帧重建缓冲 */
+    h = w;
+    if (w > scrW) w = scrW;
+    if (h > scrH) h = scrH;
+    ox = (int)(g.st.x - (float)w * 0.5f);
+    oy = (int)(g.st.y - (float)h * 0.5f);
+    ox = ox < 0 ? 0 : (ox + w > scrW ? scrW - w : ox);
+    oy = oy < 0 ? 0 : (oy + h > scrH ? scrH - h : oy);
+
+    if (ox == g.ox && oy == g.oy && w == g.ow && h == g.oh) return;
+    g.ox = ox;
+    g.oy = oy;
+    g.ow = w;
+    g.oh = h;
+    SetWindowPos(g.hwnd, HWND_TOPMOST, ox, oy, w, h, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    overlay_alloc(w, h);
+}
+
+static void run_overlay(void)
+{
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+    MSG msg;
+    float last, acc = 0.0f;
+    int frames = 0;
+
+    g.W = scrW;
+    g.H = scrH;
+    g.dpr = g.dprOverride > 0.0f ? g.dprOverride : dpi_scale(g.hwnd);
+    if (g.dpr > 2.0f) g.dpr = 2.0f;
+    if (g.dpr < 0.5f) g.dpr = 0.5f;
+    g.baseR = FMAX(80.0f, FMIN(165.0f, FMIN((float)scrW, (float)scrH) / g.dpr * 0.24f)) * g.dpr;
+
+    shape_radii_target();
+    memcpy(g_r0, g_r0t, sizeof(g_r0));
+    for (int i = 0; i < N_NODES; i++) g_radii[i] = g_r0[i];
+    g.st.x = (float)scrW * 0.5f;
+    g.st.y = (float)scrH * 0.45f;
+    g.st.scale = 1.0f;
+    g.st.scaleV = 0.0f;
+
+    overlay_layout();
+
+    if (g.shotMode) {
+        int steps = (int)((float)g.shotMs / 1000.0f / H_STEP);
+        for (int i = 0; i < steps; i++) step_physics(H_STEP);
+        overlay_layout();
+        overlay_capture();
+        overlay_render();
+        glReadPixels(0, 0, g.rw, g.rh, GL_BGRA, GL_UNSIGNED_BYTE, g_layCanvas.px);
+        save_bmp(g.shotPath, (const uint8_t *)g_layCanvas.px, g.rw, g.rh);
+        logf_("overlay shot: screen %dx%d dpr=%.2f baseR=%.1f win=%dx%d\n",
+              scrW, scrH, g.dpr, g.baseR, g.ow, g.oh);
+        return;
+    }
+
+    ShowWindow(g.hwnd, SW_SHOWNA);
+    last = now_sec();
+    while (g.running) {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                g.running = 0;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!g.running) break;
+
+        {
+            float now = now_sec();
+            float dt = now - last;
+            last = now;
+            if (dt > 0.05f) dt = 0.05f;
+            if (dt < 0.0f) dt = 0.0f;
+            acc += dt;
+            while (acc >= H_STEP) {
+                step_physics(H_STEP);
+                acc -= H_STEP;
+            }
+        }
+
+        overlay_layout();
+        if (!g.freezeCap || frames == 0) overlay_capture();
+        overlay_render();
+        overlay_present();
+
+        if (frames == 0)
+            logf_("overlay: screen %dx%d dpr=%.2f baseR=%.1f win=%dx%d\n",
+                  scrW, scrH, g.dpr, g.baseR, g.ow, g.oh);
+        frames++;
+        if (g.logOn && frames % 120 == 0)
+            logf_("overlay frames=%d t=%.1f st=(%.0f,%.0f)\n", frames, now_sec(), g.st.x, g.st.y);
+        Sleep(1);
+    }
+}
+
+
 static void update_cursor(void)
 {
     HCURSOR cur = LoadCursorW(NULL, IDC_ARROW);
@@ -2299,6 +2552,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_SIZE:
+        if (g.overlay) return 0;
         if (wp == SIZE_MINIMIZED) {
             g.minimized = 1;
         } else {
@@ -2310,6 +2564,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DPICHANGED:
         {
             RECT *r = (RECT *)lp;
+            if (g.overlay) return 0;
             SetWindowPos(hwnd, NULL, r->left, r->top,
                          r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2327,11 +2582,27 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_RBUTTONUP:
+        if (g.overlay) {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        return 0;
+
     case WM_MOUSEMOVE:
         {
             float x = (float)GET_X_LPARAM(lp);
             float y = (float)GET_Y_LPARAM(lp);
             int newHover;
+
+            if (g.overlay) {
+                POINT pt;
+                GetCursorPos(&pt);
+                g.ptr.x = (float)pt.x;
+                g.ptr.y = (float)pt.y;
+                update_cursor();
+                return 0;
+            }
 
             if (!g.ptr.dragging && !g.sliderDrag) {
                 TRACKMOUSEEVENT tme;
@@ -2384,7 +2655,28 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             float x = (float)GET_X_LPARAM(lp);
             float y = (float)GET_Y_LPARAM(lp);
-            int w = hit_widget(x, y);
+            int w;
+
+            if (g.overlay) {
+                POINT pt;
+                GetCursorPos(&pt);
+                if (blob_hit((float)pt.x, (float)pt.y)) {
+                    g.ptr.dragging = 1;
+                    g.ptr.x = (float)pt.x;
+                    g.ptr.y = (float)pt.y;
+                    g.ptr.gx = g.st.x - (float)pt.x;
+                    g.ptr.gy = g.st.y - (float)pt.y;
+                    g.st.scaleV -= 0.6f;
+                    SetCapture(hwnd);
+                    SetFocus(hwnd);
+                    logf_("overlay drag start at (%.0f,%.0f) st=(%.0f,%.0f)\n",
+                          (float)pt.x, (float)pt.y, g.st.x, g.st.y);
+                    update_cursor();
+                }
+                return 0;
+            }
+
+            w = hit_widget(x, y);
 
             SetFocus(hwnd);
             g.ptr.x = x;
@@ -2419,6 +2711,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_LBUTTONUP:
+        if (g.overlay) {
+            if (g.ptr.dragging) {
+                g.ptr.dragging = 0;
+                ReleaseCapture();
+                update_cursor();
+            }
+            return 0;
+        }
         if (g.sliderDrag) {
             g.sliderDrag = 0;
             g.active = W_NONE;
@@ -2452,6 +2752,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_ESCAPE) {
             g.running = 0;
             DestroyWindow(hwnd);
+            return 0;
+        }
+        if (g.overlay) {
+            if (wp == '1' || wp == '2' || wp == '3') {
+                g.shape = (int)(wp - '1');
+                shape_radii_target();
+                g.st.scaleV -= 1.6f;
+            }
+            return 0;
         }
         return 0;
 
@@ -2523,6 +2832,12 @@ static void parse_args(void)
         } else if (!wcscmp(a, L"--ms") && i + 1 < argc) {
             g.shotMs = _wtoi(argv[++i]);
             if (g.shotMs < 0) g.shotMs = 0;
+        } else if (!wcscmp(a, L"--debug-cap")) {
+            g.noExclude = 1;
+        } else if (!wcscmp(a, L"--freeze")) {
+            g.freezeCap = 1;
+        } else if (!wcscmp(a, L"--desktop")) {
+            g.overlay = 1;
         } else if (!wcscmp(a, L"--dpr") && i + 1 < argc) {
             g.dprOverride = (float)_wtof(argv[++i]);
         } else if (!wcscmp(a, L"--shape") && i + 1 < argc) {
@@ -2554,7 +2869,8 @@ static void parse_args(void)
                         L"Vitreous [--shot out.bmp] [--size 1200x800] [--ms 600]\n"
                         L"  [--dpr 1.5] [--shape circle|pill|squircle|0|1|2]\n"
                         L"  [--bg poster|grid|image|0|1|2] [--image PATH] [--collapse]\n"
-                        L"  [--values r,d,f,j] [--click x,y] [--drag x0,y0,x1,y1] [--log]",
+                        L"  [--values r,d,f,j] [--click x,y] [--drag x0,y0,x1,y1] [--desktop] [--log]\n"
+                        L"  desktop mode: 1/2/3 switch shape, Esc or right-click quits",
                         L"Vitreous", MB_OK);
             ExitProcess(0);
         }
@@ -2627,15 +2943,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow)
     AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0);
     winW = rc.right - rc.left;
     winH = rc.bottom - rc.top;
+    if (g.overlay) { winW = g.argW > 0 ? g.argW : 64; winH = g.argH > 0 ? g.argH : 64; }
     sx = (GetSystemMetrics(SM_CXSCREEN) - winW) / 2;
     sy = (GetSystemMetrics(SM_CYSCREEN) - winH) / 2;
     if (sx < 0) sx = 0;
     if (sy < 0) sy = 0;
 
-    hwnd = CreateWindowExW(0, L"VitreousWnd", title, WS_OVERLAPPEDWINDOW,
-                           sx, sy, winW, winH, NULL, NULL, hInst, NULL);
+    if (g.overlay) {
+        hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                               L"VitreousWnd", title, WS_POPUP,
+                               0, 0, 64, 64, NULL, NULL, hInst, NULL);
+    } else {
+        hwnd = CreateWindowExW(0, L"VitreousWnd", title, WS_OVERLAPPEDWINDOW,
+                               sx, sy, winW, winH, NULL, NULL, hInst, NULL);
+    }
     if (!hwnd) fatal("CreateWindowExW failed");
     g.hwnd = hwnd;
+    if (g.overlay && !g.noExclude && !g.freezeCap)
+        SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
 
     if (!create_gl_context(hwnd)) {
         MessageBoxW(hwnd, L"\u65e0\u6cd5\u521b\u5efa OpenGL 3.3 \u4e0a\u4e0b\u6587\u3002\n"
@@ -2651,10 +2976,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow)
     for (int i = 0; i < N_NODES; i++)
         g_offV[i] = cosf(g_theta[i] * 3.0f) * 1.2f;
 
-    {
+    if (!g.overlay) {
         RECT cr;
         GetClientRect(hwnd, &cr);
         app_resize(cr.right - cr.left, cr.bottom - cr.top);
+    }
+
+    if (g.overlay) {
+        run_overlay();
+        if (g_log) fclose(g_log);
+        return 0;
     }
 
     if (g.shotMode) {
